@@ -91,4 +91,5 @@ def gpu_bloc_matrix_pdist(
             gpu_element.release()
 
     # return dict bloc-coordinate => bloc-distance
+    client.close()
     return dists_by_coords
