@@ -38,58 +38,66 @@ def gpu_bloc_matrix_pdist(
     # prepare cluster
     cluster = LocalCUDACluster(CUDA_VISIBLE_DEVICES=gpu_devices_to_use)
     client = Client(cluster)
+    try:
 
-    # get some infos
-    n_gpu = len(gpu_devices_to_use)
-    if not chunk_size:
-        # approx 4 byte per observation inside an NxN matrix
-        chunk_size = sqrt(cluster.memory_limit / 4) / n_gpu
-        print(f"Setting {chunk_size=}")
+        # get some infos
+        n_gpu = len(gpu_devices_to_use)
+        if not chunk_size:
+            # approx 4 byte per observation inside an NxN matrix
+            chunk_size = sqrt(cluster.memory_limit / 4) / n_gpu
+            print(f"Setting {chunk_size=}")
 
-    # prepare chunks
-    n_chunks = len(X) // chunk_size
-    limit = chunk_size * (len(X) // chunk_size)
-    X_chunks = np.split(X[:limit], n_chunks)
-    if limit < len(X):
-        # don't forget the tail we may have cutted
-        X_chunks.append(X[limit:])
-        n_chunks += 1
+        # prepare chunks
+        n_chunks = len(X) // chunk_size
+        limit = chunk_size * (len(X) // chunk_size)
+        X_chunks = np.split(X[:limit], n_chunks)
+        if limit < len(X):
+            # don't forget the tail we may have cutted
+            X_chunks.append(X[limit:])
+            n_chunks += 1
 
-    # Prepare the full computation path along the n_chunk x n_chunk bloc-matrix
-    ii, jj = np.meshgrid(np.arange(n_chunks), np.arange(n_chunks))
-    ij_path = list(zip(ii.ravel(), jj.ravel()))
-    ij_path_by_n_gpu = [
-        ij_path[(i * n_gpu) : ((i + 1) * n_gpu)]
-        for i in range(1 + len(ij_path) // n_gpu)
-    ]
-
-    # now loop over every Xi, Xj bloc matrix
-    dists_by_coords = {}
-    for path in tqdm(ij_path_by_n_gpu):
-        # scatter the Xi and the Xj across the available GPUs
-        As = [
-            client.scatter(X_chunks[i], workers=gpu_id)
-            for (i, _), gpu_id in zip(path, gpu_devices_to_use)
+        # Prepare the full computation path along the n_chunk x n_chunk bloc-matrix
+        ii, jj = np.meshgrid(np.arange(n_chunks), np.arange(n_chunks))
+        ij_path = list(zip(ii.ravel(), jj.ravel()))
+        ij_path_by_n_gpu = [
+            ij_path[(i * n_gpu) : ((i + 1) * n_gpu)]
+            for i in range(1 + len(ij_path) // n_gpu)
         ]
-        Bs = [
-            client.scatter(X_chunks[j], workers=gpu_id)
-            for (_, j), gpu_id in zip(path, gpu_devices_to_use)
-        ]
-        # Proceed to bloc matrix distance on each GPU
-        Ds = [
-            client.submit(
-                lambda XA, XB: cdist(XA, XB).astype(force_type), A, B, workers=gpu_id
+
+        # now loop over every Xi, Xj bloc matrix
+        dists_by_coords = {}
+        for path in tqdm(ij_path_by_n_gpu):
+            # scatter the Xi and the Xj across the available GPUs
+            As = [
+                client.scatter(X_chunks[i], workers=gpu_id)
+                for (i, _), gpu_id in zip(path, gpu_devices_to_use)
+            ]
+            Bs = [
+                client.scatter(X_chunks[j], workers=gpu_id)
+                for (_, j), gpu_id in zip(path, gpu_devices_to_use)
+            ]
+            # Proceed to bloc matrix distance on each GPU
+            Ds = [
+                client.submit(
+                    lambda XA, XB: cdist(XA, XB).astype(force_type),
+                    A,
+                    B,
+                    workers=gpu_id,
+                )
+                for A, B, gpu_id in zip(As, Bs, gpu_devices_to_use)
+            ]
+            # Release the memory
+            for gpu_element in As + Bs:
+                gpu_element.release()
+            # Gather the blocs
+            dists_by_coords.update(
+                {coords: client.gather(D) for coords, D in zip(path, Ds)}
             )
-            for A, B, gpu_id in zip(As, Bs, gpu_devices_to_use)
-        ]
-        # Gather the blocs
-        dists_by_coords.update(
-            {coords: client.gather(D) for coords, D in zip(path, Ds)}
-        )
-        # Release the memory
-        for gpu_element in Ds + As + Bs:
-            gpu_element.release()
+            # Release the memory
+            for gpu_element in Ds:
+                gpu_element.release()
 
-    # return dict bloc-coordinate => bloc-distance
-    client.close()
-    return dists_by_coords
+        # return dict bloc-coordinate => bloc-distance
+        return dists_by_coords
+    except:
+        client.close()
